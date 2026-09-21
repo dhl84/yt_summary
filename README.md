@@ -7,11 +7,13 @@ Turn a YouTube video into a Markdown brief you can read in a minute.
 ./ytsum.py URL1 URL2 URL3                                  # several in one run
 ./ytsum.py URL --engine claude                             # the Claude CLI instead
 ./ytsum.py URL --model gemma4:latest                       # a smaller local model
+./ytsum.py URL --comments 0                                # skip the comment pass
 ```
 
 The brief lands in `out/YYYY-MM-DD-channel-title.md` with five sections: the point, key
 points with timestamps, the facts and numbers the video states, what it means for you, and
-what the video claims without evidence. Each fact carries its own context, in the form
+what the video claims without evidence. A sixth section holds the comments that carry
+information. Each fact carries its own context, in the form
 "90 fps: the frame rate in most areas", because a reader sees the line alone.
 
 ## How it works
@@ -22,7 +24,11 @@ what the video claims without evidence. Each fact carries its own context, in th
 3. Every 30 seconds the transcript keeps a `[mm:ss]` stamp, so a bullet can cite the moment.
 4. A model writes the brief. A transcript longer than 7,000 words goes in parts, and one
    more call merges the parts into a single brief.
-5. The tool copies each link from the video description to a "Links from the description"
+5. `yt-dlp` reads the 60 most liked comments. A second model call keeps the comments that
+   support a claim with a reason, add information the video leaves out, or dispute a claim
+   and say why. Each line carries the tag `[Supports]`, `[Adds]` or `[Disputes]` and the
+   like count. `--comments 0` skips the pass, and `--comments 200` reads more.
+6. The tool copies each link from the video description to a "Links from the description"
    list, with the text on the same line as the label. This gives you the mod page, the
    product page, or the repository. A description with no link gets no list.
 

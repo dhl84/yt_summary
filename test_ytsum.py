@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline checks. No network, no model. Run: python3 test_ytsum.py"""
+import json
 import tempfile
 from pathlib import Path
 import ytsum
@@ -64,6 +65,27 @@ def main():
     assert window.count("Welcome back to the") == 1, f"two-line window doubled: {window}"
     assert window.count("I am the happiest") == 1, f"two-line window doubled: {window}"
     assert "man in the world and nobody" in window, window
+
+    # comments(): the shaping, with yt-dlp replaced. Short comments go, top likes first.
+    payload = {"comments": [
+        {"text": "nice", "like_count": 900},
+        {"text": "Version 1.02 is out already", "like_count": 31},
+        {"text": "The  renderer\ngives 20 fps on\nan RTX 4080", "like_count": 2},
+        {"text": "Thanks for testing this, it answers my question", "like_count": 5,
+         "author_is_uploader": True},
+    ]}
+    real_run, ytsum.run = ytsum.run, lambda cmd, **kw: json.dumps(payload)
+    try:
+        found = ytsum.comments("https://youtu.be/x", 60)
+        assert [c[0] for c in found] == [31, 5, 2], found
+        assert found[0][1] == "Version 1.02 is out already", found[0]
+        assert found[2][1] == "The renderer gives 20 fps on an RTX 4080", found[2]
+        assert found[1][2] is True, "the uploader flag is lost"
+        ytsum.run = lambda cmd, **kw: ""
+        assert ytsum.comments("https://youtu.be/x", 60) == []
+    finally:
+        ytsum.run = real_run
+    assert ytsum.comment_brief({"title": "x"}, [], "", "ollama", "m") == ""
 
     found = ytsum.links(DESCRIPTION)
     assert found[0] == ("Mod can be found here", "https://github.com/CactusVRStudios/KHARVOX/releases"), found[0]

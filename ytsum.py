@@ -74,6 +74,36 @@ Write "none" if every claim carries evidence.
 TRANSCRIPT ({title}, channel {channel}):
 {transcript}"""
 
+COMMENTS = """You read the comments under a YouTube video. Most say nothing. Find the ones that hold information.
+
+{style}
+
+Keep a comment only when it does one of these:
+- it supports a claim in the video with a reason, a measurement or the writer's own result;
+- it adds information the video leaves out, such as a newer version, a price, a fault or a step;
+- it disputes a claim in the video and says why.
+
+Reject praise, jokes, quotes of the video, greetings, requests, and anything you cannot check.
+Reject a claim with no reason behind it. Two comments that say the same thing go in one line.
+If the writer says later in the same comment that the problem stopped, say that in the line.
+Keep the hardware, the version and the number the writer gives, because the fault can depend on them.
+
+Output this Markdown and nothing else:
+
+## From the comments
+Three to eight bullets. Start each line with "- " and then one word in brackets:
+"[Supports]", "[Adds]" or "[Disputes]". Then the point in one sentence, then the like count
+in brackets, like "- [Adds] Version 1.02 is out already. (31 likes)". A comment that reports a
+fault and then says the fault stopped gives one line with both halves, like "- [Adds] The SFS
+renderer gave 20 fps on an RTX 4080, and several restarts fixed it. (2 likes)".
+Write "- nothing substantive" if no comment holds information.
+
+The video is "{title}". Its main claims:
+{claims}
+
+COMMENTS (the like count comes first, and "CREATOR" marks a reply from the channel):
+{comments}"""
+
 MERGE = """You have several briefs from consecutive parts of one video. Merge them into one brief.
 
 {style}
@@ -92,7 +122,8 @@ INTEREST = os.environ.get(
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout
+    kw.setdefault("check", True)
+    return subprocess.run(cmd, capture_output=True, text=True, **kw).stdout
 
 
 def metadata(url):
@@ -217,6 +248,37 @@ def ask(prompt, engine, model, ctx=None):
     return reply
 
 
+def comments(url, limit):
+    """Return [(likes, text, from_uploader)] for the most liked comments, top first."""
+    # ponytail: one yt-dlp call, sorted by top. 60 comments take 4s. No paging, no API key.
+    raw = run(["yt-dlp", "-J", "--skip-download", "--write-comments", "--no-warnings",
+               "--extractor-args", f"youtube:comment_sort=top;max_comments={limit},all,{limit},0",
+               url], check=False)
+    if not raw:
+        return []
+    found = (json.loads(raw).get("comments") or [])
+    out = []
+    for c in found:
+        text = re.sub(r"\s+", " ", (c.get("text") or "")).strip()
+        if len(text) < 15:
+            continue
+        out.append((c.get("like_count") or 0, text[:400], bool(c.get("author_is_uploader"))))
+    out.sort(key=lambda x: -x[0])
+    return out
+
+
+def comment_brief(meta, found, brief, engine, model, ctx=None):
+    """Ask the model which comments hold information. Returns a Markdown section or ""."""
+    if not found:
+        return ""
+    lines = "\n".join(f"{likes} likes{' CREATOR' if mine else ''}: {text}"
+                       for likes, text, mine in found)
+    claims = "\n".join(l for l in brief.splitlines() if l.startswith("- ["))[:2000]
+    print(f"  {len(found)} comments, asking {engine}...", file=sys.stderr)
+    return ask(COMMENTS.format(style=STYLE, title=meta["title"], claims=claims,
+                               comments=lines), engine, model, ctx)
+
+
 def summarise(meta, text, engine, model, ctx=None):
     parts = chunks(text)
     briefs = []
@@ -235,7 +297,7 @@ def slug(text, limit=60):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")[:limit]
 
 
-def write_brief(meta, brief, source, words, engine, model, out_dir=OUT):
+def write_brief(meta, brief, source, words, engine, model, out_dir=OUT, extra=""):
     if not brief.strip():
         raise ValueError("refusing to write an empty brief")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,11 +312,11 @@ def write_brief(meta, brief, source, words, engine, model, out_dir=OUT):
         f"{meta['channel']} · {date[:4]}-{date[4:6]}-{date[6:8]} · {minutes}:{seconds:02d} · "
         f"[watch]({meta['url']})\n\n"
         f"Transcript: {source}, {words} words. Brief: {engine} {model}, "
-        f"{datetime.date.today().isoformat()}.\n\n---\n\n{brief}\n{found}", encoding="utf-8")
+        f"{datetime.date.today().isoformat()}.\n\n---\n\n{brief}\n{extra}{found}", encoding="utf-8")
     return path
 
 
-def one(url, engine, model, ctx=None):
+def one(url, engine, model, ctx=None, comment_limit=60):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         meta = metadata(url)
@@ -268,7 +330,13 @@ def one(url, engine, model, ctx=None):
     if words < 30:
         sys.exit(f"Transcript too short to summarise ({words} words): {url}")
     print(f"{meta['title']} — {words} words from {source}, asking {engine}...", file=sys.stderr)
-    return write_brief(meta, summarise(meta, text, engine, model, ctx), source, words, engine, model)
+    brief = summarise(meta, text, engine, model, ctx)
+    extra = ""
+    if comment_limit:
+        found = comments(url, comment_limit)
+        section = comment_brief(meta, found, brief, engine, model, ctx)
+        extra = f"\n{section}\n" if section else ""
+    return write_brief(meta, brief, source, words, engine, model, extra=extra)
 
 
 def main():
@@ -278,11 +346,14 @@ def main():
     parser.add_argument("--model", default=MODEL, help=f"Ollama model (default {MODEL})")
     parser.add_argument("--ctx", type=int, help="force an Ollama context size; costs a model reload, "
                         "and only pays off when it removes several chunks")
+    parser.add_argument("--comments", type=int, default=60, metavar="N",
+                        help="read the N most liked comments and summarise the ones with "
+                             "information (default 60, 0 to skip)")
     args = parser.parse_args()
     if not shutil.which("yt-dlp"):
         sys.exit("yt-dlp is not on PATH: brew install yt-dlp")
     for url in args.urls:
-        print(one(url, args.engine, args.model, args.ctx))
+        print(one(url, args.engine, args.model, args.ctx, args.comments))
 
 
 if __name__ == "__main__":
