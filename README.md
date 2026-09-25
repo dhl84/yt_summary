@@ -16,6 +16,38 @@ what the video claims without evidence. A sixth section holds the comments that 
 information. Each fact carries its own context, in the form
 "90 fps: the frame rate in most areas", because a reader sees the line alone.
 
+## The web page
+
+`ytsum_ui.py` serves a local page at `http://127.0.0.1:8765` and opens it in the browser.
+You paste one or more YouTube links into the box, and the page runs `ytsum.py` once for each link.
+The runs go one at a time, because the local model uses the whole GPU.
+The page lists the briefs in `out/`. When a brief is ready, the page shows it.
+
+```sh
+./ytsum_ui.py                  # start the page
+./ytsum_ui.py --no-browser     # start the server only
+```
+
+The page uses the standard library only. It listens on 127.0.0.1, so no other machine can reach it.
+Set `YTSUM_PORT` to use a port other than 8765.
+If the server already runs, a second start opens the page and stops.
+On macOS, you can double-click `ytsum-ui.command` in Finder to start the page.
+
+### Set up on Windows
+
+1. Install Python 3.11 or later, ffmpeg (`winget install ffmpeg`), and Ollama with the default model.
+2. Make a virtual environment in the repository, and install yt-dlp into it:
+
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\python -m pip install -U "yt-dlp[default]"
+   ```
+
+3. Start the page with `.venv\Scripts\pythonw ytsum_ui.py`. `pythonw` opens no console window.
+
+The page puts `.venv\Scripts` first on the PATH of each run, so `ytsum.py` finds that yt-dlp.
+If YouTube changes and yt-dlp fails, run the `pip install -U` command again.
+
 ## How it works
 
 1. `yt-dlp` reads the metadata and the English caption track. It downloads no video.
@@ -38,9 +70,10 @@ time: one idea per sentence, active voice, plain words, and the number instead o
 ## Requirements
 
 - `yt-dlp` (`brew install yt-dlp`).
+- `ffmpeg` (`brew install ffmpeg`). yt-dlp uses it to convert the captions to SRT.
 - Ollama with one instruction model. The default is `gemma4:26b-a4b-it-qat`; set
   `YTSUM_MODEL` to change it. Or pass `--engine claude` and pay for the cloud call.
-- `ffmpeg` and `whisper-cli`, for the fallback only. A video with no captions makes the tool
+- `whisper-cli`, for the fallback only. A video with no captions makes the tool
   download the audio and transcribe it with whisper.cpp, and it says so in the brief. The
   default model file comes from the OpenSuperWhisper application. A 6-minute video takes 29
   seconds, and the word count agrees with the caption count to 2 percent.
@@ -54,6 +87,7 @@ time: one idea per sentence, active voice, plain words, and the number instead o
 | `YTSUM_OUT` | `./out` | where the briefs go |
 | `YTSUM_WHISPER_MODEL` | `ggml-large-v3-turbo.bin` from OpenSuperWhisper | the whisper.cpp model file for the fallback |
 | `YTSUM_INTEREST` | finance systems, payments, job search, hardware and AI tooling | what the "For me" section answers against |
+| `YTSUM_PORT` | `8765` | the port of the web page |
 
 Change `YTSUM_INTEREST` to change the lens. The rest of the prompt stays the same.
 

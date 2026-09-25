@@ -121,9 +121,15 @@ INTEREST = os.environ.get(
     "computer hardware and AI tooling news. Say what this video changes for that reader.")
 
 
-def run(cmd, **kw):
-    kw.setdefault("check", True)
-    return subprocess.run(cmd, capture_output=True, text=True, **kw).stdout
+def run(cmd, check=True, **kw):
+    # Windows decodes pipes as cp1252 unless told otherwise, and titles hold emoji.
+    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", **kw)
+    if check and done.returncode:
+        # Say what the tool said. A traceback hides the reason, often an old yt-dlp.
+        sys.exit(f"{Path(cmd[0]).name} failed (exit {done.returncode}):\n"
+                 f"{done.stderr.strip()[-1500:]}")
+    return done.stdout
 
 
 def metadata(url):
@@ -224,7 +230,9 @@ def ask(prompt, engine, model, ctx=None):
     """One model call. Times it, because a slow call is the failure mode here."""
     start = time.time()
     if engine == "claude":
-        reply = run(["claude", "-p", prompt]).strip()
+        # The prompt goes on stdin: Windows caps a command line at 32k characters, and
+        # which() finds claude.cmd, which a bare "claude" does not on Windows.
+        reply = run([shutil.which("claude") or "claude", "-p"], input=prompt).strip()
     else:
         # ponytail: no num_ctx unless asked. Passing it forces Ollama to reload the model
         # (11s becomes 42s), and a large value costs minutes. Chunking is cheaper than context.
@@ -352,6 +360,9 @@ def main():
     args = parser.parse_args()
     if not shutil.which("yt-dlp"):
         sys.exit("yt-dlp is not on PATH: brew install yt-dlp")
+    # yt-dlp needs ffmpeg to turn the captions into SRT. Without it every video looks caption-less.
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg is not on PATH: brew install ffmpeg")
     for url in args.urls:
         print(one(url, args.engine, args.model, args.ctx, args.comments))
 
