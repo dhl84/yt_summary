@@ -50,7 +50,15 @@ If YouTube changes and yt-dlp fails, run the `pip install -U` command again.
 
 ## How it works
 
-1. `yt-dlp` reads the metadata and the English caption track. It downloads no video.
+1. `yt-dlp` reads the metadata and one caption track. It downloads no video. The tool tries
+   the tracks in this order and uses the first one that downloads:
+   - English captions that a person wrote.
+   - The YouTube auto-captions in English (`en-orig`), which YouTube makes by speech recognition.
+   - The YouTube English translation of the auto-captions (`en`).
+   - The auto-captions in the language of the video.
+
+   The tool downloads one track per call. If YouTube answers "429 Too Many Requests", the
+   tool waits 20 seconds and tries again one time. The brief names the track that it used.
 2. The parser removes the caption duplicates. Auto-captions scroll a two-line window, so
    each block repeats the line before it, and a raw transcript says each line two times.
 3. Every 30 seconds the transcript keeps a `[mm:ss]` stamp, so a bullet can cite the moment.

@@ -96,6 +96,14 @@ def main():
     assert ytsum.links("") == []
     assert len(ytsum.links(DESCRIPTION, limit=2)) == 2
 
+    # caption_tracks(): a human track first, then YouTube's English speech recognition,
+    # then the translation, then the video's own language before the other dubs.
+    auto = ["ar-orig", "en", "de-DE-orig", "en-orig", "fr-FR-orig", "fr"]
+    order = [code for _, code, _ in ytsum.caption_tracks(["en-GB", "live_chat"], auto, "fr-FR")]
+    assert order == ["en-GB", "en-orig", "en", "fr-FR-orig", "ar-orig", "de-DE-orig"], order
+    assert ytsum.caption_tracks([], ["en-orig"])[0] == ("auto", "en-orig", "YouTube auto-captions")
+    assert ytsum.caption_tracks([], []) == []
+
     assert ytsum.parse_srt("") == []
     assert ytsum.chunks("") == [""]
     assert [len(c.split()) for c in ytsum.chunks(" ".join("w" * 5 for _ in range(10)), size=4)] == [4, 4, 2]

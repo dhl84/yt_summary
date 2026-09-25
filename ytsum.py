@@ -138,7 +138,10 @@ def metadata(url):
             "channel": data.get("uploader", "unknown"),
             "date": data.get("upload_date", ""), "duration": data.get("duration") or 0,
             "url": data.get("webpage_url", url),
-            "description": data.get("description") or ""}
+            "description": data.get("description") or "",
+            "language": data.get("language") or "",
+            "subs": list(data.get("subtitles") or {}),
+            "auto": list(data.get("automatic_captions") or {})}
 
 
 def links(description, limit=15):
@@ -162,19 +165,53 @@ def links(description, limit=15):
     return out
 
 
-def captions(url, work):
-    """Return the caption file yt-dlp wrote, or None when the video has none."""
-    subprocess.run(["yt-dlp", "--skip-download", "--write-auto-subs", "--write-subs",
-                    "--sub-langs", "en.*,en", "--convert-subs", "srt", "--no-warnings",
-                    "-o", str(work / "cap"), url], capture_output=True, text=True)
-    files = sorted(work.glob("cap*.srt"))
-    return files[0] if files else None
+def caption_tracks(subs, auto, language=""):
+    """Return [(kind, code, source)] to try, best first.
+
+    A human English track first, then YouTube's own speech recognition of English
+    ("en-orig"), then its English translation, then the speech recognition of the
+    video's own language. The model reads any language, but English reads best."""
+    tracks = [("subs", c, "captions") for c in subs if c == "en" or c.startswith("en-")]
+    tracks += [("auto", c, "YouTube auto-captions") for c in auto if re.fullmatch(r"en(-\w+)?-orig", c)]
+    if "en" in auto:
+        tracks.append(("auto", "en", "YouTube auto-captions, translated to English"))
+    lang = language.split("-")[0]
+    others = [c for c in auto if c.endswith("-orig") and not c.startswith("en")]
+    others.sort(key=lambda c: c.split("-")[0] != lang)   # the video's own language first
+    tracks += [("auto", c, f"YouTube auto-captions ({c})") for c in others]
+    return tracks
 
 
-def whisper(url, work):
+def captions(url, work, meta):
+    """Return (caption file, source) for the best track that downloads, or (None, reason)."""
+    tracks = caption_tracks(meta["subs"], meta["auto"], meta["language"])
+    if not tracks:
+        return None, "YouTube lists no captions for this video, not even auto-captions"
+    error = ""
+    for kind, code, source in tracks:
+        # One track per call. A call for several tracks stops at the first failure, and
+        # YouTube often answers the translated "en" track with HTTP 429 while "en-orig" works.
+        for attempt in range(2):
+            done = subprocess.run(["yt-dlp", "--skip-download",
+                                   "--write-subs" if kind == "subs" else "--write-auto-subs",
+                                   "--sub-langs", re.escape(code), "--convert-subs", "srt",
+                                   "--no-warnings", "-o", str(work / "cap"), url],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            files = sorted(work.glob("cap*.srt"))
+            if files:
+                return files[0], source
+            error = (done.stderr.strip().splitlines() or ["yt-dlp wrote no file"])[-1]
+            if "429" not in error or attempt:
+                break
+            print(f"  {code} captions: YouTube says too many requests, retrying in 20s", file=sys.stderr)
+            time.sleep(20)
+    return None, f"YouTube lists captions, but the download failed ({error})"
+
+
+def whisper(url, work, reason="This video has no captions"):
     """Fallback for a video with no captions: download the audio and transcribe it."""
     if not shutil.which("whisper-cli"):
-        sys.exit("This video has no captions. Install the fallback: brew install whisper-cpp")
+        sys.exit(f"{reason}. Install the speech-to-text fallback: brew install whisper-cpp")
     if not Path(WHISPER_MODEL).exists():
         sys.exit(f"No whisper model at {WHISPER_MODEL}. Set YTSUM_WHISPER_MODEL to a ggml .bin file.")
     run(["yt-dlp", "-x", "--audio-format", "m4a", "--no-warnings", "-o", str(work / "a.%(ext)s"), url])
@@ -328,11 +365,12 @@ def one(url, engine, model, ctx=None, comment_limit=60):
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         meta = metadata(url)
-        caption_file = captions(url, work)
+        caption_file, source = captions(url, work, meta)
         if caption_file:
-            segments, source = parse_srt(caption_file.read_text(encoding="utf-8", errors="replace")), "captions"
+            segments = parse_srt(caption_file.read_text(encoding="utf-8", errors="replace"))
         else:
-            segments, source = whisper(url, work), "whisper.cpp"
+            print(f"  {source}. Trying whisper.cpp.", file=sys.stderr)
+            segments, source = whisper(url, work, source), "whisper.cpp"
     text = transcript_text(segments)
     words = len(text.split())
     if words < 30:
