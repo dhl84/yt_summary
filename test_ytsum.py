@@ -104,6 +104,44 @@ def main():
     assert ytsum.caption_tracks([], ["en-orig"])[0] == ("auto", "en-orig", "YouTube auto-captions")
     assert ytsum.caption_tracks([], []) == []
 
+    # pick_frames(): two frames a second. Each still stretch gives its last frame, and motion
+    # under a second gives none. A slide that gains a line gives a second frame, and
+    # drop_repeats() removes the first one when it compares the text.
+    black, white, grey = bytes(16), bytes([255] * 16), bytes([128] * 16)
+    line = bytes([255] * 2 + [0] * 14)     # the black slide with one short line of text
+    noise = bytes([(j * 91) % 256 for j in range(16)])
+    thumbs = [black] * 6 + [line] * 4 + [noise] + [white] * 6 + [grey] * 4
+    assert ytsum.pick_frames(thumbs, 2) == [5, 9, 16, 20], ytsum.pick_frames(thumbs, 2)
+    assert ytsum.pick_frames([black] * 4 + [bytes([1] * 16)] * 4, 2) == [7], "a flicker split a slide"
+    assert len(ytsum.pick_frames(thumbs, 2, limit=1)) <= 1
+    assert ytsum.pick_frames([], 2) == []
+
+    found = [(1, "4 AIs built a machine."), (6, "4 AIs built a machine. One used 6x fewer tokens."),
+             (19, "THE CHALLENGE"), (25, "the challenge"), (31, "Build time: Opus 55 s")]
+    assert [s for s, _ in ytsum.drop_repeats(found)] == [6, 25, 31], ytsum.drop_repeats(found)
+
+    # fallback(): whisper first; no speech means the screen; the exit names every reason.
+    real = ytsum.whisper, ytsum.screen_text
+    try:
+        ytsum.whisper = lambda *a: [(0, "word " * 40)]
+        assert ytsum.fallback("u", None, {}, "no captions")[1] == "whisper.cpp"
+        ytsum.whisper = lambda *a: [(0, "Music")]
+        ytsum.screen_text = lambda *a: [(3, "THE RACE")]
+        segments, source, every = ytsum.fallback("u", None, {}, "no captions")
+        assert source.startswith("on-screen") and every == 1 and segments == [(3, "THE RACE")]
+
+        def missing(*a):
+            raise ytsum.NoTranscript("whisper.cpp is not installed")
+        ytsum.whisper = ytsum.screen_text = missing
+        try:
+            ytsum.fallback("u", None, {}, "no captions")
+            raise AssertionError("fallback returned with no transcript")
+        except SystemExit as e:
+            assert "No captions. Whisper.cpp is not installed" in str(e), e
+    finally:
+        ytsum.whisper, ytsum.screen_text = real
+    assert ytsum.transcript_text([(3, "a"), (9, "b")], every=1) == "[00:03] a \n[00:09] b"
+
     assert ytsum.parse_srt("") == []
     assert ytsum.chunks("") == [""]
     assert [len(c.split()) for c in ytsum.chunks(" ".join("w" * 5 for _ in range(10)), size=4)] == [4, 4, 2]

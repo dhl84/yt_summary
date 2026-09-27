@@ -48,6 +48,18 @@ On macOS, you can double-click `ytsum-ui.command` in Finder to start the page.
 The page puts `.venv\Scripts` first on the PATH of each run, so `ytsum.py` finds that yt-dlp.
 If YouTube changes and yt-dlp fails, run the `pip install -U` command again.
 
+To install the fallbacks for videos with no captions, put whisper.cpp and its models in
+`tools\whisper`. Git ignores that folder. The CUDA 12.4 build runs on an RTX 5090.
+
+```powershell
+gh release download -R ggml-org/whisper.cpp -p "whisper-cublas-12.4.0-bin-x64.zip"
+Expand-Archive whisper-cublas-12.4.0-bin-x64.zip tmp; Move-Item tmp\Release\* tools\whisper
+$hf = "https://huggingface.co"
+curl.exe -L -o tools\whisper\ggml-large-v3-turbo.bin "$hf/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+curl.exe -L -o tools\whisper\ggml-silero-v5.1.2.bin "$hf/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+ollama pull qwen3-vl:8b
+```
+
 ## How it works
 
 1. `yt-dlp` reads the metadata and one caption track. It downloads no video. The tool tries
@@ -59,6 +71,17 @@ If YouTube changes and yt-dlp fails, run the `pip install -U` command again.
 
    The tool downloads one track per call. If YouTube answers "429 Too Many Requests", the
    tool waits 20 seconds and tries again one time. The brief names the track that it used.
+
+   If no track downloads, the tool downloads the audio, and whisper.cpp transcribes the speech.
+   The Silero VAD model (voice activity detection) passes only the parts with speech to whisper.
+   Without VAD, whisper writes words over music, like "Thank you."
+
+   If whisper finds fewer than 30 words, the video has no speech. Some videos show their
+   text on screen over music. For these, the tool downloads the video at 720p or less.
+   It keeps the last frame of each still stretch, because a slide or a caption holds still.
+   A local vision model reads the text in each frame, and each frame gets its own `[mm:ss]`
+   stamp. A 166-second slide video gives 22 frames. If the vision model gives no answer in
+   180 seconds, the run stops with a message, because a busy GPU stalls it.
 2. The parser removes the caption duplicates. Auto-captions scroll a two-line window, so
    each block repeats the line before it, and a raw transcript says each line two times.
 3. Every 30 seconds the transcript keeps a `[mm:ss]` stamp, so a bullet can cite the moment.
@@ -85,6 +108,10 @@ time: one idea per sentence, active voice, plain words, and the number instead o
   download the audio and transcribe it with whisper.cpp, and it says so in the brief. The
   default model file comes from the OpenSuperWhisper application. A 6-minute video takes 29
   seconds, and the word count agrees with the caption count to 2 percent.
+  The tool looks for `whisper-cli` on PATH, then in `tools/whisper`. On macOS, put the VAD
+  model in `tools/whisper` with the `curl` line from the Windows steps.
+- `qwen3-vl:8b` in Ollama (`ollama pull qwen3-vl:8b`), for the screen text fallback only.
+  The tool uses this local model for the frames with every engine, also with `--engine claude`.
 
 ## Settings
 
@@ -93,7 +120,13 @@ time: one idea per sentence, active voice, plain words, and the number instead o
 | `YTSUM_MODEL` | `gemma4:26b-a4b-it-qat` | the Ollama model |
 | `OLLAMA_HOST` | `http://localhost:11434` | the Ollama server |
 | `YTSUM_OUT` | `./out` | where the briefs go |
-| `YTSUM_WHISPER_MODEL` | `ggml-large-v3-turbo.bin` from OpenSuperWhisper | the whisper.cpp model file for the fallback |
+| `YTSUM_WHISPER_MODEL` | `ggml-large-v3-turbo.bin` from OpenSuperWhisper, else from `tools/whisper` | the whisper.cpp model file for the fallback |
+| `YTSUM_WHISPER_CLI` | `whisper-cli` on PATH, else in `tools/whisper` | the whisper.cpp program |
+| `YTSUM_VAD_MODEL` | `tools/whisper/ggml-silero-v5.1.2.bin` | the VAD model. With no file, whisper runs without VAD |
+| `YTSUM_WHISPER_ARGS` | none | more whisper-cli flags, for example `-ng` to keep whisper off the GPU |
+| `YTSUM_VISION_MODEL` | `qwen3-vl:8b` | the Ollama model that reads the frames |
+| `YTSUM_VISION_TIMEOUT` | `180` | the seconds to wait for one frame |
+| `YTSUM_MAX_FRAMES` | `80` | the most frames to read from one video |
 | `YTSUM_INTEREST` | finance systems, payments, job search, hardware and AI tooling | what the "For me" section answers against |
 | `YTSUM_PORT` | `8765` | the port of the web page |
 

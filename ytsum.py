@@ -9,8 +9,10 @@ to out/YYYY-MM-DD-channel-title.md.
 
 Engines: --engine ollama (default, local and free) or claude (the CLI).
 No captions on the video? It downloads the audio and uses whisper.cpp.
+No speech either? It reads the text on screen with a local vision model.
 """
 import argparse
+import base64
 import datetime
 import json
 import os
@@ -21,14 +23,27 @@ import subprocess
 import sys
 import time
 import tempfile
+import urllib.error
 import urllib.request
 
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434") + "/api/generate"
 MODEL = os.environ.get("YTSUM_MODEL", "gemma4:26b-a4b-it-qat")
 OUT = Path(os.environ.get("YTSUM_OUT", Path(__file__).parent / "out"))
 STAMP_EVERY = 30          # seconds between the timestamps kept in the transcript
-WHISPER_MODEL = os.environ.get("YTSUM_WHISPER_MODEL", str(Path.home() /
-    "Library/Application Support/ru.starmel.OpenSuperWhisper/whisper-models/ggml-large-v3-turbo.bin"))
+MIN_WORDS = 30            # fewer words than this is no transcript
+# The fallbacks look in tools/whisper (git-ignored) after PATH and the Mac app folder.
+TOOLS = Path(__file__).resolve().parent / "tools" / "whisper"
+WHISPER_CLI = os.environ.get("YTSUM_WHISPER_CLI") or shutil.which("whisper-cli") or str(
+    TOOLS / ("whisper-cli.exe" if os.name == "nt" else "whisper-cli"))
+_MAC_MODEL = (Path.home() / "Library/Application Support/ru.starmel.OpenSuperWhisper/"
+              "whisper-models/ggml-large-v3-turbo.bin")
+WHISPER_MODEL = os.environ.get("YTSUM_WHISPER_MODEL") or str(
+    _MAC_MODEL if _MAC_MODEL.exists() else TOOLS / "ggml-large-v3-turbo.bin")
+# Silero VAD finds the speech. Without it whisper writes words over music, like "Thank you."
+VAD_MODEL = os.environ.get("YTSUM_VAD_MODEL") or str(TOOLS / "ggml-silero-v5.1.2.bin")
+VISION_MODEL = os.environ.get("YTSUM_VISION_MODEL", "qwen3-vl:8b")
+VISION_TIMEOUT = int(os.environ.get("YTSUM_VISION_TIMEOUT", 180))   # seconds per frame; a busy GPU stalls
+MAX_FRAMES = int(os.environ.get("YTSUM_MAX_FRAMES", 80))
 CHUNK_WORDS = int(os.environ.get("YTSUM_CHUNK_WORDS", 3500))   # ~4,700 tokens, fits the 8k context Ollama loads by default
 
 # ponytail: the rules live here as text, not as a config file or a fetched skill.
@@ -121,14 +136,14 @@ INTEREST = os.environ.get(
     "computer hardware and AI tooling news. Say what this video changes for that reader.")
 
 
-def run(cmd, check=True, **kw):
+def run(cmd, check=True, binary=False, **kw):
     # Windows decodes pipes as cp1252 unless told otherwise, and titles hold emoji.
-    done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", **kw)
+    text = {} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}
+    done = subprocess.run(cmd, capture_output=True, **text, **kw)
     if check and done.returncode:
         # Say what the tool said. A traceback hides the reason, often an old yt-dlp.
-        sys.exit(f"{Path(cmd[0]).name} failed (exit {done.returncode}):\n"
-                 f"{done.stderr.strip()[-1500:]}")
+        error = done.stderr if isinstance(done.stderr, str) else done.stderr.decode("utf-8", "replace")
+        sys.exit(f"{Path(cmd[0]).name} failed (exit {done.returncode}):\n{error.strip()[-1500:]}")
     return done.stdout
 
 
@@ -208,19 +223,150 @@ def captions(url, work, meta):
     return None, f"YouTube lists captions, but the download failed ({error})"
 
 
-def whisper(url, work, reason="This video has no captions"):
-    """Fallback for a video with no captions: download the audio and transcribe it."""
-    if not shutil.which("whisper-cli"):
-        sys.exit(f"{reason}. Install the speech-to-text fallback: brew install whisper-cpp")
+class NoTranscript(Exception):
+    """A fallback that cannot give a transcript. The message says why."""
+
+
+def whisper(url, work, meta):
+    """Fallback for a video with no captions: download the audio and transcribe the speech."""
+    if not (shutil.which(WHISPER_CLI) or Path(WHISPER_CLI).exists()):
+        raise NoTranscript("whisper.cpp is not installed (brew install whisper-cpp)")
     if not Path(WHISPER_MODEL).exists():
-        sys.exit(f"No whisper model at {WHISPER_MODEL}. Set YTSUM_WHISPER_MODEL to a ggml .bin file.")
+        raise NoTranscript(f"there is no whisper model at {WHISPER_MODEL}")
+    print("  transcribing the audio with whisper.cpp...", file=sys.stderr)
     run(["yt-dlp", "-x", "--audio-format", "m4a", "--no-warnings", "-o", str(work / "a.%(ext)s"), url])
     # whisper.cpp reads 16 kHz mono WAV only. ffmpeg comes with yt-dlp on this machine.
     run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(work / "a.m4a"),
          "-ar", "16000", "-ac", "1", str(work / "a.wav")])
-    run(["whisper-cli", "-m", WHISPER_MODEL, "-f", str(work / "a.wav"),
-         "-osrt", "-of", str(work / "a"), "-np"])
-    return parse_srt((work / "a.srt").read_text(encoding="utf-8"))
+    cmd = [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", str(work / "a.wav"), "-osrt", "-of", str(work / "a"),
+           "-np", "-l", (meta.get("language") or "auto").split("-")[0]]
+    if Path(VAD_MODEL).exists():
+        cmd += ["--vad", "-vm", VAD_MODEL]
+    cmd += os.environ.get("YTSUM_WHISPER_ARGS", "").split()   # for example "-ng" to keep off the GPU
+    try:
+        run(cmd, timeout=max(600, 2 * meta.get("duration", 0)))
+    except subprocess.TimeoutExpired:
+        raise NoTranscript("whisper.cpp took too long, and the GPU may be busy")
+    srt = work / "a.srt"
+    return parse_srt(srt.read_text(encoding="utf-8", errors="replace")) if srt.exists() else []
+
+
+SCREEN = """This is one frame of a video with no speech. Write out the text on screen, word for word,
+in reading order. For a chart or a table, give each label with its value and unit.
+If a picture carries meaning that the text does not, add one sentence that describes it.
+If the frame holds no text, answer NO TEXT. Output plain text only."""
+
+
+def pick_frames(thumbs, fps, limit=MAX_FRAMES):
+    """Return the indexes of the frames worth reading, from small grey frames taken fps times a second.
+
+    A slide or a caption holds still, so each still stretch gives its last frame, which holds the
+    most text. Motion shorter than a second gives no frame. A stretch that looks like the one
+    before replaces it, because text often appears one line at a time."""
+    def diff(a, b):
+        return sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
+    step = 2.0
+    while True:
+        runs, start = [], 0
+        for i in range(1, len(thumbs) + 1):
+            if i == len(thumbs) or diff(thumbs[i], thumbs[i - 1]) > step:
+                runs.append((start, i - 1))
+                start = i
+        kept = []
+        for first, last in runs:
+            if last - first + 1 < fps:
+                continue
+            if kept and diff(thumbs[last], thumbs[kept[-1]]) < 2 * step:
+                kept[-1] = last
+            else:
+                kept.append(last)
+        if not kept and thumbs:   # all motion: one frame every 10 seconds
+            kept = list(range(min(5 * fps, len(thumbs) - 1), len(thumbs), 10 * fps))[:limit]
+        if len(kept) <= limit:
+            return kept
+        step *= 1.5
+
+
+def drop_repeats(found):
+    """Drop a frame whose text the next frame repeats, and a frame that repeats the one before."""
+    def norm(text):
+        return re.sub(r"\W+", " ", text).lower().strip()
+    out = []
+    for i, (seconds, text) in enumerate(found):
+        following = found[i + 1][1] if i + 1 < len(found) else ""
+        if norm(text) in norm(following) or (out and norm(out[-1][1]) == norm(text)):
+            continue
+        out.append((seconds, text))
+    return out
+
+
+def read_frame(path, last=False):
+    """Ask the local vision model for the text in one frame. Returns "" for a frame with none."""
+    body = {"model": VISION_MODEL, "prompt": SCREEN, "stream": False, "think": False,
+            "images": [base64.b64encode(path.read_bytes()).decode()],
+            "options": {"temperature": 0, "num_predict": 800}}
+    if last:
+        body["keep_alive"] = 0   # give the GPU memory back after the last frame
+    request = urllib.request.Request(OLLAMA, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=VISION_TIMEOUT) as response:
+            reply = (json.load(response).get("response") or "").strip()
+    except urllib.error.HTTPError as e:
+        raise NoTranscript(f"Ollama refused {VISION_MODEL} ({e.read().decode(errors='replace')[:200]}). "
+                           f"Run: ollama pull {VISION_MODEL}")
+    except OSError as e:
+        raise NoTranscript(f"the vision model {VISION_MODEL} gave no answer in {VISION_TIMEOUT}s ({e}), "
+                           f"and the GPU may be busy")
+    if not reply or reply.upper().startswith("NO TEXT"):
+        return ""
+    return " / ".join(line.strip() for line in reply.splitlines() if line.strip())
+
+
+def screen_text(url, work, meta):
+    """Fallback for a video with no speech: read the text on screen, one frame per still stretch."""
+    run(["yt-dlp", "-f", "bv*[height<=720]/b[height<=720]/bv*/b", "--no-warnings",
+         "-o", str(work / "v.%(ext)s"), url])
+    video = next(work.glob("v.*"))
+    fps, width, height = 2, 64, 36
+    raw = run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(video), "-vf",
+               f"fps={fps},scale={width}:{height},format=gray", "-f", "rawvideo", "-"], binary=True)
+    size = width * height
+    thumbs = [raw[i:i + size] for i in range(0, len(raw) - size + 1, size)]
+    picks = pick_frames(thumbs, fps)
+    print(f"  reading the text in {len(picks)} frames with {VISION_MODEL}...", file=sys.stderr)
+    found = []
+    for n, index in enumerate(picks):
+        jpg = work / f"f{n:03d}.jpg"
+        run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", f"{index / fps:.2f}", "-i", str(video),
+             "-frames:v", "1", "-q:v", "3", str(jpg)])
+        text = read_frame(jpg, last=n == len(picks) - 1) if jpg.exists() else ""
+        if text:
+            found.append((index // fps, text))
+    return drop_repeats(found)
+
+
+def fallback(url, work, meta, reason):
+    """No captions: transcribe the speech, or read the screen when there is no speech.
+
+    Returns (segments, source, seconds between stamps), or exits with every reason."""
+    reasons = [reason]
+    print(f"  {reason}.", file=sys.stderr)
+    try:
+        segments = whisper(url, work, meta)
+        if sum(len(text.split()) for _, text in segments) >= MIN_WORDS:
+            return segments, "whisper.cpp", STAMP_EVERY
+        reasons.append("whisper.cpp found no speech")
+        print("  whisper.cpp found no speech. Reading the screen instead.", file=sys.stderr)
+    except (NoTranscript, SystemExit) as e:
+        reasons.append(str(e))
+    try:
+        segments = screen_text(url, work, meta)
+        if segments:
+            return segments, f"on-screen text read by {VISION_MODEL}", 1   # a stamp on every frame
+        reasons.append("the frames hold no text")
+    except (NoTranscript, SystemExit) as e:
+        reasons.append(str(e))
+    sys.exit("No transcript for this video. " + ". ".join(r[0].upper() + r[1:] for r in reasons) + ".")
 
 
 def parse_srt(text):
@@ -247,13 +393,13 @@ def parse_srt(text):
     return out
 
 
-def transcript_text(segments):
-    """One text with [mm:ss] every STAMP_EVERY seconds."""
+def transcript_text(segments, every=STAMP_EVERY):
+    """One text with [mm:ss] every `every` seconds."""
     parts, next_stamp = [], 0
     for seconds, body in segments:
         if seconds >= next_stamp:
             parts.append(f"\n[{seconds // 60:02d}:{seconds % 60:02d}] ")
-            next_stamp = seconds + STAMP_EVERY
+            next_stamp = seconds + every
         parts.append(body + " ")
     return re.sub(r" +", " ", "".join(parts)).strip()
 
@@ -367,13 +513,14 @@ def one(url, engine, model, ctx=None, comment_limit=60):
         meta = metadata(url)
         caption_file, source = captions(url, work, meta)
         if caption_file:
-            segments = parse_srt(caption_file.read_text(encoding="utf-8", errors="replace"))
+            segments, every = parse_srt(caption_file.read_text(encoding="utf-8", errors="replace")), STAMP_EVERY
         else:
-            print(f"  {source}. Trying whisper.cpp.", file=sys.stderr)
-            segments, source = whisper(url, work, source), "whisper.cpp"
-    text = transcript_text(segments)
+            segments, source, every = fallback(url, work, meta, source)
+    text = transcript_text(segments, every)
     words = len(text.split())
-    if words < 30:
+    if source.startswith("on-screen"):
+        text = "(The video has no speech. Each stamp is one frame, and the line is the text on screen.)\n" + text
+    if words < MIN_WORDS:
         sys.exit(f"Transcript too short to summarise ({words} words): {url}")
     print(f"{meta['title']} — {words} words from {source}, asking {engine}...", file=sys.stderr)
     brief = summarise(meta, text, engine, model, ctx)
